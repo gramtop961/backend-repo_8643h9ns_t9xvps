@@ -1,9 +1,11 @@
 import os
+import base64
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from bson import ObjectId
+from starlette.responses import Response
 
 from database import db, create_document, get_documents
 from schemas import Conversation as ConversationSchema, Message as MessageSchema
@@ -31,11 +33,13 @@ class MessageResponse(BaseModel):
     conversation_id: str
     role: str
     content: str
+    attachments: Optional[List[str]] = None
     created_at: Optional[str] = None
 
 class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[str] = None
+    attachments: Optional[List[str]] = None
 
 class ChatResponse(BaseModel):
     conversation_id: str
@@ -48,6 +52,8 @@ def to_str_id(doc):
         doc["id"] = str(doc.pop("_id"))
     if doc.get("conversation_id") and isinstance(doc["conversation_id"], ObjectId):
         doc["conversation_id"] = str(doc["conversation_id"])
+    if doc.get("message_id") and isinstance(doc["message_id"], ObjectId):
+        doc["message_id"] = str(doc["message_id"])
     return doc
 
 
@@ -169,6 +175,7 @@ def list_messages(conversation_id: str = Query(..., description="Conversation ID
                 conversation_id=str(d.get("conversation_id")),
                 role=d.get("role", "user"),
                 content=d.get("content", ""),
+                attachments=d.get("attachments"),
                 created_at=ca,
             )
         )
@@ -194,11 +201,12 @@ def chat(req: ChatRequest):
         raise HTTPException(status_code=400, detail="Invalid conversation_id")
 
     # Store user message
-    user_msg = MessageSchema(conversation_id=str(conv_id), role="user", content=user_text)
+    user_msg = MessageSchema(conversation_id=str(conv_id), role="user", content=user_text, attachments=req.attachments)
     create_document("message", {
         "conversation_id": conv_oid,
         "role": user_msg.role,
         "content": user_msg.content,
+        "attachments": req.attachments or [],
     })
 
     # Generate assistant reply
@@ -209,6 +217,7 @@ def chat(req: ChatRequest):
         "conversation_id": conv_oid,
         "role": "assistant",
         "content": reply_text,
+        "attachments": [],
     }
     reply_id = create_document("message", assistant_msg_doc)
 
@@ -217,8 +226,74 @@ def chat(req: ChatRequest):
         conversation_id=str(conv_id),
         role="assistant",
         content=reply_text,
+        attachments=[],
     )
     return ChatResponse(conversation_id=str(conv_id), reply=reply)
+
+
+@app.post("/attachments")
+async def upload_attachment(
+    file: UploadFile = File(...),
+    conversation_id: Optional[str] = Form(None),
+    message_id: Optional[str] = Form(None),
+):
+    data = await file.read()
+    b64 = base64.b64encode(data).decode("utf-8")
+
+    conv_oid = None
+    msg_oid = None
+    if conversation_id:
+        try:
+            conv_oid = ObjectId(conversation_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid conversation_id")
+    if message_id:
+        try:
+            msg_oid = ObjectId(message_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid message_id")
+
+    doc = {
+        "conversation_id": conv_oid,
+        "message_id": msg_oid,
+        "filename": file.filename,
+        "content_type": file.content_type,
+        "size": len(data),
+        "data_base64": b64,
+    }
+    att_id = create_document("attachment", doc)
+    return {
+        "id": att_id,
+        "filename": file.filename,
+        "content_type": file.content_type,
+        "size": len(data),
+        "download_url": f"/attachments/{att_id}",
+    }
+
+
+@app.get("/attachments/{attachment_id}")
+def download_attachment(attachment_id: str):
+    try:
+        oid = ObjectId(attachment_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid attachment id")
+
+    results = get_documents("attachment", {"_id": oid})
+    if not results:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    att = results[0]
+    try:
+        raw = base64.b64decode(att.get("data_base64", ""))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Corrupted attachment data")
+
+    filename = att.get("filename") or "download"
+    content_type = att.get("content_type") or "application/octet-stream"
+
+    headers = {
+        "Content-Disposition": f"attachment; filename=\"{filename}\""
+    }
+    return Response(content=raw, media_type=content_type, headers=headers)
 
 
 if __name__ == "__main__":

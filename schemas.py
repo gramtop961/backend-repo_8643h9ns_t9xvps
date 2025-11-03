@@ -12,7 +12,7 @@ Model name is converted to lowercase for the collection name:
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 
 # Example schemas (replace with your own):
 
@@ -55,6 +55,19 @@ class Message(BaseModel):
     conversation_id: str = Field(..., description="Related conversation id as string")
     role: Literal["user", "assistant", "system"] = Field("user", description="Message role")
     content: str = Field(..., description="Message content")
+    attachments: Optional[List[str]] = Field(default=None, description="List of attachment IDs")
+
+class Attachment(BaseModel):
+    """
+    Attachments collection schema
+    Collection name: "attachment"
+    """
+    conversation_id: Optional[str] = Field(None, description="Related conversation id as string")
+    message_id: Optional[str] = Field(None, description="Related message id as string")
+    filename: str = Field(..., description="Original file name")
+    content_type: Optional[str] = Field(None, description="MIME type")
+    size: int = Field(..., description="Size in bytes")
+    data_base64: str = Field(..., description="File data encoded in base64")
 
 # Note: The Flames database viewer will automatically:
 # 1. Read these schemas from GET /schema endpoint
