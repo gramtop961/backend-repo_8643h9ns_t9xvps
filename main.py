@@ -10,6 +10,10 @@ from starlette.responses import Response
 from database import db, create_document, get_documents
 from schemas import Conversation as ConversationSchema, Message as MessageSchema
 
+# Optional OpenAI integration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_APIKEY") or os.getenv("OPENAI_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
 app = FastAPI()
 
 app.add_middleware(
@@ -19,6 +23,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class ChatRequest(BaseModel):
+    message: str
+    attachments: Optional[List[dict]] = None
+
+class ChatReply(BaseModel):
+    reply: str
 
 
 class CreateConversationRequest(BaseModel):
@@ -36,14 +48,6 @@ class MessageResponse(BaseModel):
     attachments: Optional[List[str]] = None
     created_at: Optional[str] = None
 
-class ChatRequest(BaseModel):
-    message: str
-    conversation_id: Optional[str] = None
-    attachments: Optional[List[str]] = None
-
-class ChatResponse(BaseModel):
-    conversation_id: str
-    reply: MessageResponse
 
 
 def to_str_id(doc):
@@ -57,11 +61,7 @@ def to_str_id(doc):
     return doc
 
 
-def generate_assistant_reply(user_text: str) -> str:
-    """
-    Simple built-in assistant logic to keep the app fully self-contained and unlimited.
-    This is rule-based and does not use external APIs.
-    """
+def local_generate_assistant_reply(user_text: str) -> str:
     t = user_text.strip()
     if not t:
         return "I'm here! Ask me anything."
@@ -86,14 +86,8 @@ def read_root():
     return {"message": "Chat API is running"}
 
 
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
-
-
 @app.get("/test")
 def test_database():
-    """Test endpoint to check if database is available and accessible"""
     response = {
         "backend": "✅ Running",
         "database": "❌ Not Available",
@@ -122,113 +116,78 @@ def test_database():
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
 
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
+    import os as _os
+    response["database_url"] = "✅ Set" if _os.getenv("DATABASE_URL") else "❌ Not Set"
+    response["database_name"] = "✅ Set" if _os.getenv("DATABASE_NAME") else "❌ Not Set"
 
     return response
 
 
-@app.post("/conversations", response_model=ConversationResponse)
-def create_conversation(req: CreateConversationRequest):
-    title = req.title or "New Chat"
-    conv = ConversationSchema(title=title)
-    inserted_id = create_document("conversation", conv)
-    return {"id": inserted_id, "title": title}
-
-
-@app.get("/conversations", response_model=List[ConversationResponse])
-def list_conversations():
-    docs = get_documents("conversation", {})
-    result = []
-    for d in docs:
-        d = to_str_id(d)
-        result.append({"id": d["id"], "title": d.get("title", "Chat")})
-    # newest first by created_at if present
-    result.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    return result
-
-
-@app.get("/messages", response_model=List[MessageResponse])
-def list_messages(conversation_id: str = Query(..., description="Conversation ID")):
-    try:
-        conv_oid = ObjectId(conversation_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid conversation_id")
-
-    docs = get_documents("message", {"conversation_id": conv_oid})
-    # sort by created_at if present
-    docs.sort(key=lambda x: x.get("created_at"))
-    out = []
-    for d in docs:
-        d = to_str_id(d)
-        # Standardize created_at to ISO if present
-        ca = None
-        if "created_at" in d and d["created_at"] is not None:
-            try:
-                ca = d["created_at"].isoformat()
-            except Exception:
-                ca = None
-        out.append(
-            MessageResponse(
-                id=d["id"],
-                conversation_id=str(d.get("conversation_id")),
-                role=d.get("role", "user"),
-                content=d.get("content", ""),
-                attachments=d.get("attachments"),
-                created_at=ca,
-            )
-        )
-    return out
-
-
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat", response_model=ChatReply)
 def chat(req: ChatRequest):
     user_text = (req.message or "").strip()
     if not user_text:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    # Ensure conversation
-    conv_id = req.conversation_id
-    if not conv_id:
+    # Optional: store messages to DB (simple log)
+    try:
         conv = ConversationSchema(title=user_text[:40] or "New Chat")
         conv_id = create_document("conversation", conv)
-
-    # Validate/convert conv id
-    try:
         conv_oid = ObjectId(conv_id)
+        create_document("message", {
+            "conversation_id": conv_oid,
+            "role": "user",
+            "content": user_text,
+            "attachments": req.attachments or [],
+        })
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid conversation_id")
+        conv_oid = None
 
-    # Store user message
-    user_msg = MessageSchema(conversation_id=str(conv_id), role="user", content=user_text, attachments=req.attachments)
-    create_document("message", {
-        "conversation_id": conv_oid,
-        "role": user_msg.role,
-        "content": user_msg.content,
-        "attachments": req.attachments or [],
-    })
+    # Build system prompt with attachment summary
+    attachment_note = ""
+    if req.attachments:
+        try:
+            names = ", ".join([a.get("name", "file") for a in req.attachments])
+            attachment_note = f"\n\nUser included attachments: {names}. If relevant, reference them in your answer."
+        except Exception:
+            attachment_note = ""
 
-    # Generate assistant reply
-    reply_text = generate_assistant_reply(user_text)
+    reply_text = None
 
-    # Store assistant message
-    assistant_msg_doc = {
-        "conversation_id": conv_oid,
-        "role": "assistant",
-        "content": reply_text,
-        "attachments": [],
-    }
-    reply_id = create_document("message", assistant_msg_doc)
+    # Try OpenAI first if key is available
+    if OPENAI_API_KEY:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            completion = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are StudyCenter Ai, a helpful, concise study assistant. Prefer clear, structured answers."},
+                    {"role": "user", "content": user_text + attachment_note},
+                ],
+                temperature=0.3,
+            )
+            reply_text = completion.choices[0].message.content or ""
+        except Exception as e:
+            # Fallback to local
+            reply_text = None
 
-    reply = MessageResponse(
-        id=reply_id,
-        conversation_id=str(conv_id),
-        role="assistant",
-        content=reply_text,
-        attachments=[],
-    )
-    return ChatResponse(conversation_id=str(conv_id), reply=reply)
+    if not reply_text:
+        reply_text = local_generate_assistant_reply(user_text)
+
+    # Save assistant message
+    try:
+        if conv_oid is not None:
+            create_document("message", {
+                "conversation_id": conv_oid,
+                "role": "assistant",
+                "content": reply_text,
+                "attachments": [],
+            })
+    except Exception:
+        pass
+
+    return {"reply": reply_text}
 
 
 @app.post("/attachments")
